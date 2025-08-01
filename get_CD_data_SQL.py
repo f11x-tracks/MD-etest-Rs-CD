@@ -1,0 +1,126 @@
+import PyUber
+import pandas as pd
+import numpy as np
+import dash
+from dash import Dash, dcc, html, State, callback
+from dash import dash_table as dt
+from dash.dependencies import Input, Output
+import plotly.express as px
+import plotly.graph_objects as go
+import plotly.io as pio
+
+
+SQL_DATA = '''
+SELECT  
+        a1.entity AS entity
+        ,To_Char(a1.data_collection_time,'yyyy-mm-dd hh24:mi:ss') AS entity_data_collect_date
+        ,a0.operation AS spc_operation
+        ,a0.lot AS lot
+        ,(SELECT lrc99.last_pass FROM F_LOT_RUN_CARD lrc99 where lrc99.lot =a0.lot AND lrc99.operation = a0.operation AND lrc99.site_prevout_date=a0.prev_moveout_time and rownum<=1) AS last_pass
+        ,a4.wafer AS waferID
+        ,a4.wafer3 AS raw_wafer3
+        ,a4.parameter_name AS CD_NAME
+        ,a4.value AS CD
+        ,a3.measurement_set_name AS measurement_set_name
+        ,a3.valid_flag as valid_flag
+        ,a3.standard_flag as standard_flag
+        ,a4.native_x_col AS X
+        ,a4.native_y_row AS Y
+        ,a0.route AS route
+        ,a0.product AS product
+        ,a0.process_operation AS OPN
+FROM 
+P_SPC_LOT a0
+LEFT JOIN P_SPC_ENTITY a1 ON a1.spcs_id = a0.spcs_id AND a1.entity_sequence=1
+INNER JOIN P_SPC_SESSION a2 ON a2.spcs_id = a0.spcs_id AND a2.data_collection_time = a0.data_collection_time
+INNER JOIN P_SPC_MEASUREMENT_SET a3 ON a3.spcs_id = a2.spcs_id
+LEFT JOIN P_SPC_MEASUREMENT a4 ON a4.spcs_id = a3.spcs_id AND a4.measurement_set_name = a3.measurement_set_name
+WHERE
+a1.data_collection_time >= TRUNC(SYSDATE) - 90
+AND (a3.measurement_set_name = 'CD.FCCD_MEASUREMENTS.5051' or a3.measurement_set_name = 'CD.DCCD_MEASUREMENTS.5051')
+AND (a4.parameter_name like '%MET%'
+or a4.parameter_name like '%MDT%'
+)
+'''
+
+try:
+    conn = PyUber.connect(datasource='F21_PROD_XEUS')
+    df = pd.read_sql(SQL_DATA, conn)
+    
+    # Parse CD_NAME by splitting on semicolons
+    def parse_cd_name(cd_name):
+        if pd.isna(cd_name):
+            return None, None
+        
+        parts = str(cd_name).split(';')
+        
+        # LAYER is between first and second ';' (index 1)
+        layer = parts[1] if len(parts) > 1 else None
+        
+        # CD_SITE is at index 2
+        cd_site = parts[2] if len(parts) > 2 else None
+        
+        return layer, cd_site
+    
+    # Apply the parsing function and create new columns
+    df[['LAYER', 'CD_SITE']] = df['CD_NAME'].apply(
+        lambda x: pd.Series(parse_cd_name(x))
+    )
+    
+    # Convert ENTITY_DATA_COLLECT_DATE to datetime for proper sorting
+    df['ENTITY_DATA_COLLECT_DATE'] = pd.to_datetime(df['ENTITY_DATA_COLLECT_DATE'])
+    
+    # Check for duplicates based on ENTITY_DATA_COLLECT_DATE, LAYER, WAFERID, CD_NAME, X, Y
+    print(f'Before filtering for duplicates: {len(df)} rows')
+    duplicate_cols = ['ENTITY_DATA_COLLECT_DATE', 'LAYER', 'WAFERID', 'CD_NAME', 'X', 'Y']
+    
+    # Check if there are any duplicates
+    duplicates = df.duplicated(subset=duplicate_cols, keep=False)
+    if duplicates.any():
+        print(f'Found {duplicates.sum()} duplicate rows based on {duplicate_cols}')
+        print('Sample duplicates:')
+        print(df[duplicates][duplicate_cols + ['CD']].head(10))
+        
+        # Keep only the most recent one for each duplicate group
+        # Since we're looking for exact duplicates, we'll keep the first occurrence after sorting
+        df_filtered = df.sort_values(duplicate_cols + ['ENTITY_DATA_COLLECT_DATE']).drop_duplicates(
+            subset=duplicate_cols, keep='last'
+        )
+    else:
+        print('No duplicates found')
+        df_filtered = df.copy()
+        
+    print(f'After filtering for duplicates: {len(df_filtered)} rows')
+    
+    # Sort the data by ENTITY_DATA_COLLECT_DATE and LOT before converting back to string
+    df_filtered = df_filtered.sort_values(['ENTITY_DATA_COLLECT_DATE', 'LOT'])
+    
+    # Convert datetime back to string for output consistency
+    df_filtered['ENTITY_DATA_COLLECT_DATE'] = df_filtered['ENTITY_DATA_COLLECT_DATE'].dt.strftime('%Y-%m-%d %H:%M:%S')
+    
+    # Show the distribution of parsed values
+    print(f'LAYER value counts:')
+    print(df_filtered['LAYER'].value_counts(dropna=False))
+    print(f'\nCD_SITE value counts:')
+    print(df_filtered['CD_SITE'].value_counts(dropna=False))
+    
+    # Show a sample of the parsed data
+    print(f'\nSample of parsed data:')
+    sample_cols = ['CD_NAME', 'LAYER', 'CD_SITE', 'ENTITY_DATA_COLLECT_DATE', 'LOT']
+    print(df_filtered[sample_cols].head(10))
+    
+    # Output the dataframe to a text file
+    output_file = 'CD-data-sql.txt'
+    df_filtered.to_csv(output_file, sep=',', index=False)
+    print(f'\nData successfully saved to {output_file}')
+    print(f'Data shape: {df_filtered.shape}')
+    print(f'Columns: {list(df_filtered.columns)}')
+    
+    # Show summary of date filtering
+    print(f'\nDate filtering summary:')
+    date_summary = df_filtered.groupby(['WAFERID', 'LAYER'])['ENTITY_DATA_COLLECT_DATE'].first().reset_index()
+    print(f'Unique WAFERID/LAYER combinations: {len(date_summary)}')
+    print(f'Date range: {df_filtered["ENTITY_DATA_COLLECT_DATE"].min()} to {df_filtered["ENTITY_DATA_COLLECT_DATE"].max()}')
+except Exception as e:
+    print(f'Cannot run SQL script - Consider connecting to VPN. Error: {e}')
+
