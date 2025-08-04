@@ -70,22 +70,42 @@ try:
     # Convert ENTITY_DATA_COLLECT_DATE to datetime for proper sorting
     df['ENTITY_DATA_COLLECT_DATE'] = pd.to_datetime(df['ENTITY_DATA_COLLECT_DATE'])
     
-    # Check for duplicates based on ENTITY_DATA_COLLECT_DATE, LAYER, WAFERID, CD_NAME, X, Y
+    # Check for duplicates based on LAYER, WAFERID, CD_NAME, X, Y
     print(f'Before filtering for duplicates: {len(df)} rows')
-    duplicate_cols = ['ENTITY_DATA_COLLECT_DATE', 'LAYER', 'WAFERID', 'CD_NAME', 'X', 'Y']
+    duplicate_cols = ['LAYER', 'WAFERID', 'CD_NAME', 'X', 'Y']
     
     # Check if there are any duplicates
     duplicates = df.duplicated(subset=duplicate_cols, keep=False)
     if duplicates.any():
         print(f'Found {duplicates.sum()} duplicate rows based on {duplicate_cols}')
-        print('Sample duplicates:')
-        print(df[duplicates][duplicate_cols + ['CD']].head(10))
+        print('Sample duplicates (showing dates):')
+        sample_duplicates = df[duplicates][duplicate_cols + ['CD', 'ENTITY_DATA_COLLECT_DATE']].head(10)
+        print(sample_duplicates.sort_values(['WAFERID', 'LAYER', 'X', 'Y', 'ENTITY_DATA_COLLECT_DATE']))
         
-        # Keep only the most recent one for each duplicate group
-        # Since we're looking for exact duplicates, we'll keep the first occurrence after sorting
+        # For each duplicate group, keep only the most recent one based on ENTITY_DATA_COLLECT_DATE
+        print('\nRemoving duplicates - keeping most recent data by ENTITY_DATA_COLLECT_DATE for each spatial location...')
+        
+        # Sort by duplicate columns and date, then keep the last (most recent) for each duplicate group
         df_filtered = df.sort_values(duplicate_cols + ['ENTITY_DATA_COLLECT_DATE']).drop_duplicates(
             subset=duplicate_cols, keep='last'
         )
+        
+        # Show what was removed
+        removed_count = len(df) - len(df_filtered)
+        print(f'Removed {removed_count} older duplicate measurements')
+        
+        # Show sample of kept vs removed for verification
+        if removed_count > 0:
+            duplicate_groups = df[duplicates].groupby(duplicate_cols)
+            sample_group = list(duplicate_groups)[0]  # Get first group
+            group_key, group_data = sample_group
+            if len(group_data) > 1:
+                print(f'\nExample duplicate group at location {group_key[:2]} X={group_key[3]} Y={group_key[4]}:')
+                group_sorted = group_data.sort_values('ENTITY_DATA_COLLECT_DATE')
+                print('  All measurements for this location:')
+                for _, row in group_sorted.iterrows():
+                    print(f'    Date: {row["ENTITY_DATA_COLLECT_DATE"]}, CD: {row["CD"]:.3f}')
+                print(f'  → Kept: {group_sorted.iloc[-1]["ENTITY_DATA_COLLECT_DATE"]} (most recent)')
     else:
         print('No duplicates found')
         df_filtered = df.copy()
