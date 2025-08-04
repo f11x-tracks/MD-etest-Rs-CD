@@ -6,10 +6,54 @@ from plotly.subplots import make_subplots
 import pandas as pd
 import numpy as np
 from scipy.interpolate import griddata
+import io
+import base64
+from datetime import datetime
+import sys
+
+# Print Python version information
+print("=== Python Environment Information ===")
+print(f"Python version: {sys.version}")
+print(f"Python executable: {sys.executable}")
+print("=" * 50)
 
 # Load the data
 df_cd = pd.read_csv('data/CD-data-sql.txt')
 df_rs = pd.read_csv('data/filtered_ETestData.txt')
+
+# Load wafer conditions data
+try:
+    print("Loading wafer_conditions.txt...")
+    # Manually parse the file to handle space-separated format
+    wafer_conditions = {}
+    with open('wafer_conditions.txt', 'r') as f:
+        lines = f.readlines()
+        
+        for i, line in enumerate(lines):
+            if i == 0:  # Skip header
+                continue
+                
+            # Split on whitespace (spaces and tabs) and filter out empty strings
+            parts = [p for p in line.strip().split() if p]
+            
+            if len(parts) >= 2:
+                wafer_id = parts[0]
+                layer = parts[1]
+                
+                # If there are 3 or more parts, everything after layer is the condition
+                if len(parts) >= 3:
+                    condition = ' '.join(parts[2:])  # Join remaining parts with spaces
+                else:
+                    condition = ''
+                
+                if condition:  # Only add if condition exists and is not empty
+                    wafer_conditions[(wafer_id, layer)] = condition
+                        
+    print(f"Loaded {len(wafer_conditions)} wafer-layer combinations with conditions")
+            
+except Exception as e:
+    print(f"Warning: Could not load wafer conditions file: {e}")
+    wafer_conditions = {}
 
 # Separate FCCD and DCCD data
 df_fccd = df_cd[df_cd['MEASUREMENT_SET_NAME'].str.contains('FCCD', na=False)].copy()
@@ -154,8 +198,8 @@ wafer_groups = {k: np.array(v) for k, v in wafer_groups.items()}
 
 print(f"Found {len(wafer_groups)} unique PRODUCT, LOT (from RS), and LAYER combinations")
 
-def create_contour_plot(df, x_col, y_col, z_col, title, colorscale='Viridis'):
-    """Create a contour plot from scattered data"""
+def create_contour_plot(df, x_col, y_col, z_col, title, colorscale='Viridis', z_min=None, z_max=None):
+    """Create a contour plot from scattered data with optional z-axis scaling"""
     if df.empty:
         # Return empty plot if no data
         fig = go.Figure()
@@ -208,6 +252,12 @@ def create_contour_plot(df, x_col, y_col, z_col, title, colorscale='Viridis'):
     # Create grid that stays within the actual data bounds
     grid_x, grid_y = np.mgrid[x_min:x_max:100j, y_min:y_max:100j]
     
+    # Use provided z-scale limits or calculate from data
+    if z_min is None:
+        z_min = z.min()
+    if z_max is None:
+        z_max = z.max()
+    
     # Interpolate data to grid
     try:
         # Use linear interpolation only within the convex hull of data points
@@ -234,10 +284,12 @@ def create_contour_plot(df, x_col, y_col, z_col, title, colorscale='Viridis'):
             line=dict(width=0.5),
             contours=dict(
                 coloring='fill',
-                start=np.nanmin(grid_z),
-                end=np.nanmax(grid_z),
-                size=(np.nanmax(grid_z) - np.nanmin(grid_z)) / 15  # Fewer levels for cleaner look
+                start=z_min,
+                end=z_max,
+                size=(z_max - z_min) / 15  # Fewer levels for cleaner look
             ),
+            zmin=z_min,  # Set consistent z-scale
+            zmax=z_max,
             hovertemplate='X: %{x}<br>Y: %{y}<br>Z: %{z:.3f}<extra></extra>',
             connectgaps=False  # Don't connect across gaps - important!
         ))
@@ -267,7 +319,9 @@ def create_contour_plot(df, x_col, y_col, z_col, title, colorscale='Viridis'):
                 color=z,
                 colorscale=colorscale,
                 showscale=True,
-                colorbar=dict(title="Value")
+                colorbar=dict(title="Value"),
+                cmin=z_min,  # Set consistent z-scale for scatter plot too
+                cmax=z_max
             ),
             hovertemplate='X: %{x}<br>Y: %{y}<br>Value: %{marker.color:.3f}<extra></extra>'
         ))
@@ -277,9 +331,9 @@ def create_contour_plot(df, x_col, y_col, z_col, title, colorscale='Viridis'):
         title=title,
         xaxis_title="X",
         yaxis_title="Y",
-        height=486,  # Reduced by another 10% from 540 to 486
-        width=486,   # Set width equal to height for square plots
-        margin=dict(l=40, r=40, t=50, b=40),  # Original margins
+        height=436,  # Reduced by 50px from 486 to 436
+        width=486,   # Keep width the same for contour plots
+        margin=dict(l=20, r=10, t=50, b=30),  # Reduced margins to give more plot area
         xaxis=dict(autorange=True),  # Let X-axis auto-scale to show all data
         yaxis=dict(autorange=True),  # Let Y-axis auto-scale to show all data
         font=dict(size=12)  # Original font size
@@ -288,10 +342,178 @@ def create_contour_plot(df, x_col, y_col, z_col, title, colorscale='Viridis'):
     return fig
 
 # Create a function to generate plots based on filter criteria
-def generate_plots(filter_option, show_summary, selected_layer=None, selected_cd_site=None):
+def calculate_group_ranges(wafer_groups, df_fccd_common, df_dccd_common, df_rs_common):
+    """Calculate min/max ranges for RBS, FCCD, and DCCD for each product/lot/layer group"""
+    group_ranges = {}
+    
+    for (product, lot, layer), wafer_ids in wafer_groups.items():
+        # Skip if layer is NaN
+        if pd.isna(layer):
+            continue
+            
+        # Determine which RBS column to use based on layer
+        if layer == 'MDT':
+            rbs_column = 'RBS_MFW2'
+        elif layer == 'MET':
+            rbs_column = 'RBS_MF2W2'
+        else:
+            continue
+            
+        # Collect all values for this group
+        all_rbs_values = []
+        all_fccd_values = []
+        all_dccd_values = []
+        
+        for wafer_id in wafer_ids:
+            # RBS data for this wafer
+            rs_data = df_rs_common[(df_rs_common['WAFER_ID'] == wafer_id) & 
+                                 (df_rs_common[rbs_column].notna())]
+            if not rs_data.empty:
+                all_rbs_values.extend(rs_data[rbs_column].values)
+            
+            # FCCD data for this wafer and layer
+            fccd_data = df_fccd_common[(df_fccd_common['WAFERID'] == wafer_id) & 
+                                     (df_fccd_common['LAYER'] == layer)]
+            if not fccd_data.empty:
+                all_fccd_values.extend(fccd_data['CD'].values)
+            
+            # DCCD data for this wafer and layer
+            dccd_data = df_dccd_common[(df_dccd_common['WAFERID'] == wafer_id) & 
+                                     (df_dccd_common['LAYER'] == layer)]
+            if not dccd_data.empty:
+                all_dccd_values.extend(dccd_data['CD'].values)
+        
+        # Calculate ranges for this group
+        group_key = (product, lot, layer)
+        group_ranges[group_key] = {
+            'rbs_min': min(all_rbs_values) if all_rbs_values else None,
+            'rbs_max': max(all_rbs_values) if all_rbs_values else None,
+            'fccd_min': min(all_fccd_values) if all_fccd_values else None,
+            'fccd_max': max(all_fccd_values) if all_fccd_values else None,
+            'dccd_min': min(all_dccd_values) if all_dccd_values else None,
+            'dccd_max': max(all_dccd_values) if all_dccd_values else None,
+            'rbs_column': rbs_column
+        }
+    
+    return group_ranges
+
+def generate_complete_summary_stats():
+    """Generate complete summary statistics for all layers and CD sites for Excel export"""
+    all_summary_data = []
+    
+    for (product, lot, layer), wafer_ids in wafer_groups.items():
+        # Skip if layer is NaN
+        if pd.isna(layer):
+            continue
+            
+        # Determine which RBS column to use based on layer
+        if layer == 'MDT':
+            rbs_column = 'RBS_MFW2'
+            rbs_title = 'RBS_MFW2 (Rs)'
+        elif layer == 'MET':
+            rbs_column = 'RBS_MF2W2'
+            rbs_title = 'RBS_MF2W2 (Rs)'
+        else:
+            continue
+        
+        # Get all CD sites for this layer
+        layer_cd_sites = layer_cd_site_map.get(layer, [])
+        
+        for wafer_id in sorted(wafer_ids):
+            # Filter RS data for selected wafer with valid values in the selected RBS column
+            rs_data = df_rs_common[(df_rs_common['WAFER_ID'] == wafer_id) & 
+                                 (df_rs_common[rbs_column].notna())].copy()
+            
+            if rs_data.empty:
+                continue
+            
+            # Filter FCCD and DCCD data for selected wafer and layer
+            fccd_data = df_fccd_common[(df_fccd_common['WAFERID'] == wafer_id) & 
+                                     (df_fccd_common['LAYER'] == layer)]
+            dccd_data = df_dccd_common[(df_dccd_common['WAFERID'] == wafer_id) & 
+                                     (df_dccd_common['LAYER'] == layer)]
+            
+            if fccd_data.empty and dccd_data.empty:
+                continue
+            
+            # Calculate RBS statistics
+            rbs_avg = rs_data[rbs_column].mean()
+            rbs_std = rs_data[rbs_column].std()
+            rbs_min = rs_data[rbs_column].min()
+            rbs_max = rs_data[rbs_column].max()
+            rbs_count = len(rs_data)
+            
+            # Calculate FCCD statistics (all data for the layer)
+            fccd_avg = fccd_data['CD'].mean() if not fccd_data.empty else np.nan
+            fccd_std = fccd_data['CD'].std() if not fccd_data.empty else np.nan
+            fccd_min = fccd_data['CD'].min() if not fccd_data.empty else np.nan
+            fccd_max = fccd_data['CD'].max() if not fccd_data.empty else np.nan
+            fccd_count = len(fccd_data) if not fccd_data.empty else 0
+            
+            # Calculate DCCD statistics (all data for the layer)
+            dccd_avg = dccd_data['CD'].mean() if not dccd_data.empty else np.nan
+            dccd_std = dccd_data['CD'].std() if not dccd_data.empty else np.nan
+            dccd_min = dccd_data['CD'].min() if not dccd_data.empty else np.nan
+            dccd_max = dccd_data['CD'].max() if not dccd_data.empty else np.nan
+            dccd_count = len(dccd_data) if not dccd_data.empty else 0
+            
+            # For each CD site, calculate scatter statistics
+            for cd_site in layer_cd_sites:
+                fccd_scatter_data = fccd_data[fccd_data['CD_SITE'] == cd_site] if not fccd_data.empty else pd.DataFrame()
+                dccd_scatter_data = dccd_data[dccd_data['CD_SITE'] == cd_site] if not dccd_data.empty else pd.DataFrame()
+                
+                fccd_scatter_count = len(fccd_scatter_data)
+                dccd_scatter_count = len(dccd_scatter_data)
+                
+                # Calculate scatter-specific statistics
+                fccd_scatter_avg = fccd_scatter_data['CD'].mean() if not fccd_scatter_data.empty else np.nan
+                fccd_scatter_std = fccd_scatter_data['CD'].std() if not fccd_scatter_data.empty else np.nan
+                dccd_scatter_avg = dccd_scatter_data['CD'].mean() if not dccd_scatter_data.empty else np.nan
+                dccd_scatter_std = dccd_scatter_data['CD'].std() if not dccd_scatter_data.empty else np.nan
+                
+                # Get condition for this wafer and layer
+                condition = wafer_conditions.get((wafer_id, layer), '')
+                
+                all_summary_data.append({
+                    'Product': product,
+                    'Lot': lot,
+                    'Layer': layer,
+                    'CD_Site': cd_site,
+                    'Wafer_ID': wafer_id,
+                    'Condition': condition,
+                    'RBS_Column': rbs_column,
+                    'RBS_Count': rbs_count,
+                    'RBS_Avg': rbs_avg if not np.isnan(rbs_avg) else None,
+                    'RBS_StdDev': rbs_std if not np.isnan(rbs_std) else None,
+                    'RBS_Min': rbs_min if not np.isnan(rbs_min) else None,
+                    'RBS_Max': rbs_max if not np.isnan(rbs_max) else None,
+                    'FCCD_Total_Count': fccd_count,
+                    'FCCD_Total_Avg': fccd_avg if not np.isnan(fccd_avg) else None,
+                    'FCCD_Total_StdDev': fccd_std if not np.isnan(fccd_std) else None,
+                    'FCCD_Total_Min': fccd_min if not np.isnan(fccd_min) else None,
+                    'FCCD_Total_Max': fccd_max if not np.isnan(fccd_max) else None,
+                    'DCCD_Total_Count': dccd_count,
+                    'DCCD_Total_Avg': dccd_avg if not np.isnan(dccd_avg) else None,
+                    'DCCD_Total_StdDev': dccd_std if not np.isnan(dccd_std) else None,
+                    'DCCD_Total_Min': dccd_min if not np.isnan(dccd_min) else None,
+                    'DCCD_Total_Max': dccd_max if not np.isnan(dccd_max) else None,
+                    'FCCD_Scatter_Count': fccd_scatter_count,
+                    'FCCD_Scatter_Avg': fccd_scatter_avg if not np.isnan(fccd_scatter_avg) else None,
+                    'FCCD_Scatter_StdDev': fccd_scatter_std if not np.isnan(fccd_scatter_std) else None,
+                    'DCCD_Scatter_Count': dccd_scatter_count,
+                    'DCCD_Scatter_Avg': dccd_scatter_avg if not np.isnan(dccd_scatter_avg) else None,
+                    'DCCD_Scatter_StdDev': dccd_scatter_std if not np.isnan(dccd_scatter_std) else None
+                })
+    
+    return pd.DataFrame(all_summary_data)
+
+def generate_plots(filter_option, selected_layer=None, selected_cd_site=None, scale_option='auto'):
     """Generate plots based on filter and display options"""
     plots = []
     plot_count = 0
+    
+    # Calculate group ranges for normalized scaling
+    group_ranges = calculate_group_ranges(wafer_groups, df_fccd_common, df_dccd_common, df_rs_common)
 
     for (product, lot, layer), wafer_ids in wafer_groups.items():
         # Skip if layer is NaN
@@ -311,6 +533,19 @@ def generate_plots(filter_option, show_summary, selected_layer=None, selected_cd
             rbs_title = 'RBS_MF2W2 (Rs)'
         else:
             continue  # Skip unknown layers
+        
+        # Get group ranges for normalized scaling
+        group_key = (product, lot, layer)
+        ranges = group_ranges.get(group_key, {})
+        
+        # Determine scaling parameters
+        if scale_option == 'normalized':
+            rbs_min, rbs_max = ranges.get('rbs_min'), ranges.get('rbs_max')
+            fccd_min, fccd_max = ranges.get('fccd_min'), ranges.get('fccd_max')
+            dccd_min, dccd_max = ranges.get('dccd_min'), ranges.get('dccd_max')
+        else:
+            # Auto-scale (None values will make plots use their own data ranges)
+            rbs_min = rbs_max = fccd_min = fccd_max = dccd_min = dccd_max = None
         
         # Filter and collect valid wafers for this group
         valid_wafers = []
@@ -391,8 +626,12 @@ def generate_plots(filter_option, show_summary, selected_layer=None, selected_cd
             fccd_scatter_count = len(fccd_scatter_data) if not fccd_scatter_data.empty else 0
             dccd_scatter_count = len(dccd_scatter_data) if not dccd_scatter_data.empty else 0
             
+            # Get condition for this wafer and layer
+            condition = wafer_conditions.get((wafer_id, layer), '')
+            
             summary_data.append({
                 'Wafer_ID': wafer_id,
+                'Condition': condition,
                 'RBS_Avg': f"{rbs_avg:.3f}" if not np.isnan(rbs_avg) else "N/A",
                 'RBS_StdDev': f"{rbs_std:.3f}" if not np.isnan(rbs_std) else "N/A",
                 'FCCD_Avg': f"{fccd_avg:.3f}" if not np.isnan(fccd_avg) else "N/A",
@@ -406,10 +645,22 @@ def generate_plots(filter_option, show_summary, selected_layer=None, selected_cd
         # Create summary table component
         summary_table = html.Div([
             html.H3("Summary Statistics", style={'textAlign': 'center', 'marginBottom': 15, 'color': '#333'}),
+            # Add group range information if using normalized scaling
+            html.Div([
+                html.P(f"Group Scale Ranges (Product: {product}, Lot: {lot}, Layer: {layer}):" if scale_option == 'normalized' else "Individual Scale Ranges:", 
+                       style={'fontWeight': 'bold', 'margin': '5px 0'}),
+                html.P(f"{rbs_title}: {ranges.get('rbs_min', 'N/A'):.3f} - {ranges.get('rbs_max', 'N/A'):.3f}" if scale_option == 'normalized' and ranges.get('rbs_min') is not None else f"{rbs_title}: Auto-scaled per wafer", 
+                       style={'margin': '2px 0', 'fontSize': '12px'}),
+                html.P(f"FCCD: {ranges.get('fccd_min', 'N/A'):.3f} - {ranges.get('fccd_max', 'N/A'):.3f}" if scale_option == 'normalized' and ranges.get('fccd_min') is not None else "FCCD: Auto-scaled per wafer", 
+                       style={'margin': '2px 0', 'fontSize': '12px'}),
+                html.P(f"DCCD: {ranges.get('dccd_min', 'N/A'):.3f} - {ranges.get('dccd_max', 'N/A'):.3f}" if scale_option == 'normalized' and ranges.get('dccd_min') is not None else "DCCD: Auto-scaled per wafer", 
+                       style={'margin': '2px 0', 'fontSize': '12px'})
+            ], style={'backgroundColor': '#e8f4fd', 'padding': '8px', 'borderRadius': '3px', 'marginBottom': '10px'}),
             html.Table([
                 html.Thead([
                     html.Tr([
                         html.Th("Wafer ID", style={'padding': '8px', 'border': '1px solid #ddd', 'backgroundColor': '#f2f2f2'}),
+                        html.Th("Condition", style={'padding': '8px', 'border': '1px solid #ddd', 'backgroundColor': '#f2f2f2'}),
                         html.Th(f"{rbs_title} Avg", style={'padding': '8px', 'border': '1px solid #ddd', 'backgroundColor': '#f2f2f2'}),
                         html.Th(f"{rbs_title} StdDev", style={'padding': '8px', 'border': '1px solid #ddd', 'backgroundColor': '#f2f2f2'}),
                         html.Th("FCCD Avg", style={'padding': '8px', 'border': '1px solid #ddd', 'backgroundColor': '#f2f2f2'}),
@@ -423,6 +674,7 @@ def generate_plots(filter_option, show_summary, selected_layer=None, selected_cd
                 html.Tbody([
                     html.Tr([
                         html.Td(row['Wafer_ID'], style={'padding': '6px', 'border': '1px solid #ddd', 'textAlign': 'center'}),
+                        html.Td(row['Condition'], style={'padding': '6px', 'border': '1px solid #ddd', 'textAlign': 'center', 'fontSize': '11px'}),
                         html.Td(row['RBS_Avg'], style={'padding': '6px', 'border': '1px solid #ddd', 'textAlign': 'center'}),
                         html.Td(row['RBS_StdDev'], style={'padding': '6px', 'border': '1px solid #ddd', 'textAlign': 'center'}),
                         html.Td(row['FCCD_Avg'], style={'padding': '6px', 'border': '1px solid #ddd', 'textAlign': 'center'}),
@@ -447,12 +699,16 @@ def generate_plots(filter_option, show_summary, selected_layer=None, selected_cd
         # Create plots for each wafer in this group - each wafer on its own row
         for wafer_id, rs_data, fccd_data, dccd_data, fccd_scatter_data, dccd_scatter_data in valid_wafers:
             print(f"Creating plots for wafer: {wafer_id}")
+            
+            # Get condition for this wafer and layer
+            condition = wafer_conditions.get((wafer_id, layer), '')
                 
-            # Create RBS plot
+            # Create RBS plot with shorter title
             fig_rs = create_contour_plot(
                 rs_data, 'X', 'Y', rbs_column, 
-                f'{rbs_title} - {wafer_id}',
-                colorscale='RdBu'  # Red to Blue (reversed for resistivity)
+                f'{rbs_title}',
+                colorscale='RdBu',  # Red to Blue (reversed for resistivity)
+                z_min=rbs_min, z_max=rbs_max
             )
             
             # Create FCCD plot if data exists
@@ -460,8 +716,9 @@ def generate_plots(filter_option, show_summary, selected_layer=None, selected_cd
             if not fccd_data.empty:
                 fig_fccd = create_contour_plot(
                     fccd_data, 'X', 'Y', 'CD', 
-                    f'CD (FCCD) - {wafer_id}',
-                    colorscale='RdBu_r'  # Blue to Red (normal for dimension)
+                    f'FCCD',
+                    colorscale='RdBu_r',  # Blue to Red (normal for dimension)
+                    z_min=fccd_min, z_max=fccd_max
                 )
             
             # Create DCCD plot if data exists
@@ -469,8 +726,9 @@ def generate_plots(filter_option, show_summary, selected_layer=None, selected_cd
             if not dccd_data.empty:
                 fig_dccd = create_contour_plot(
                     dccd_data, 'X', 'Y', 'CD', 
-                    f'CD (DCCD) - {wafer_id}',
-                    colorscale='RdBu_r'  # Blue to Red (normal for dimension)
+                    f'DCCD',
+                    colorscale='RdBu_r',  # Blue to Red (normal for dimension)
+                    z_min=dccd_min, z_max=dccd_max
                 )
             
             # Create layout based on available data
@@ -480,7 +738,7 @@ def generate_plots(filter_option, show_summary, selected_layer=None, selected_cd
             # Add RBS plot
             plot_divs.append(
                 html.Div([
-                    dcc.Graph(figure=fig_rs, style={'height': '486px'})
+                    dcc.Graph(figure=fig_rs, style={'height': '436px'})  # Updated height
                 ], style={'width': '19%', 'display': 'inline-block', 'verticalAlign': 'top'})
             )
             
@@ -489,7 +747,7 @@ def generate_plots(filter_option, show_summary, selected_layer=None, selected_cd
                 plot_count_for_wafer += 1
                 plot_divs.append(
                     html.Div([
-                        dcc.Graph(figure=fig_fccd, style={'height': '486px'})
+                        dcc.Graph(figure=fig_fccd, style={'height': '436px'})  # Updated height
                     ], style={'width': '19%', 'display': 'inline-block', 'verticalAlign': 'top', 'marginLeft': '1%'})
                 )
             
@@ -498,7 +756,7 @@ def generate_plots(filter_option, show_summary, selected_layer=None, selected_cd
                 plot_count_for_wafer += 1
                 plot_divs.append(
                     html.Div([
-                        dcc.Graph(figure=fig_dccd, style={'height': '486px'})
+                        dcc.Graph(figure=fig_dccd, style={'height': '436px'})  # Updated height
                     ], style={'width': '19%', 'display': 'inline-block', 'verticalAlign': 'top', 'marginLeft': '1%'})
                 )
             
@@ -548,17 +806,17 @@ def generate_plots(filter_option, show_summary, selected_layer=None, selected_cd
                         customdata=merged_fccd_rbs['distance']
                     ))
                     fig_fccd_rbs.update_layout(
-                        title=f'FCCD vs {rbs_title}<br><sub>Layer: {selected_layer}, Site: {selected_cd_site} ({len(merged_fccd_rbs)} matched points)</sub>',
+                        title=f'FCCD vs {rbs_title}',
                         xaxis_title='FCCD',
                         yaxis_title=rbs_title,
-                        height=486,
-                        width=486,
-                        margin=dict(l=30, r=30, t=50, b=30),
+                        height=436,  # Reduced by 50px to match contour plots
+                        width=436,   # Reduced by 50px to keep square
+                        margin=dict(l=20, r=10, t=50, b=30),  # Consistent with contour plots
                         font=dict(size=10)
                     )
                     plot_divs.append(
                         html.Div([
-                            dcc.Graph(figure=fig_fccd_rbs, style={'height': '486px'})
+                            dcc.Graph(figure=fig_fccd_rbs, style={'height': '436px'})  # Updated height
                         ], style={'width': '19%', 'display': 'inline-block', 'verticalAlign': 'top', 'marginLeft': '1%'})
                     )
             
@@ -605,62 +863,36 @@ def generate_plots(filter_option, show_summary, selected_layer=None, selected_cd
                         customdata=merged_dccd_rbs['distance']
                     ))
                     fig_dccd_rbs.update_layout(
-                        title=f'DCCD vs {rbs_title}<br><sub>Layer: {selected_layer}, Site: {selected_cd_site} ({len(merged_dccd_rbs)} matched points)</sub>',
+                        title=f'DCCD vs {rbs_title}',
                         xaxis_title='DCCD',
                         yaxis_title=rbs_title,
-                        height=486,
-                        width=486,
-                        margin=dict(l=30, r=30, t=50, b=30),
+                        height=436,  # Reduced by 50px to match contour plots
+                        width=436,   # Reduced by 50px to keep square
+                        margin=dict(l=20, r=10, t=50, b=30),  # Consistent with contour plots
                         font=dict(size=10)
                     )
                     plot_divs.append(
                         html.Div([
-                            dcc.Graph(figure=fig_dccd_rbs, style={'height': '540px'})
+                            dcc.Graph(figure=fig_dccd_rbs, style={'height': '436px'})  # Updated height - was 540px
                         ], style={'width': '19%', 'display': 'inline-block', 'verticalAlign': 'top', 'marginLeft': '1%'})
                     )
             
-            # Create single row layout for this wafer
-            wafer_plots = html.Div([
-                html.H4(f"Wafer: {wafer_id}", style={'textAlign': 'center', 'marginBottom': 10})
-            ] + plot_divs, style={'marginBottom': '20px'})
+            # Create single row layout for this wafer with header
+            condition_text = f" | {condition}" if condition else ""
             
-            # Add data summary if enabled
-            summary_section = html.Div()
-            if show_summary == 'show':
-                summary_section = html.Div([
-                    html.H4(f"Data Summary for {wafer_id}", style={'textAlign': 'center'}),
-                    html.Div([
-                        html.Div([
-                            html.P(f"{rbs_title} Data: {len(rs_data)} points"),
-                            html.P(f"Range: {rs_data[rbs_column].min():.3f} - {rs_data[rbs_column].max():.3f}" if not rs_data.empty else "No data"),
-                        ], style={'width': '20%', 'display': 'inline-block', 'textAlign': 'center'}),
-                        
-                        html.Div([
-                            html.P(f"FCCD Data: {len(fccd_data)} points" if not fccd_data.empty else "FCCD: No data"),
-                            html.P(f"Range: {fccd_data['CD'].min():.3f} - {fccd_data['CD'].max():.3f}" if not fccd_data.empty else "No data"),
-                        ], style={'width': '20%', 'display': 'inline-block', 'textAlign': 'center', 'marginLeft': '2%'}),
-                        
-                        html.Div([
-                            html.P(f"DCCD Data: {len(dccd_data)} points" if not dccd_data.empty else "DCCD: No data"),
-                            html.P(f"Range: {dccd_data['CD'].min():.3f} - {dccd_data['CD'].max():.3f}" if not dccd_data.empty else "No data"),
-                        ], style={'width': '20%', 'display': 'inline-block', 'textAlign': 'center', 'marginLeft': '2%'}),
-                        
-                        html.Div([
-                            html.P(f"FCCD Scatter: {len(fccd_scatter_data)} points" if not fccd_scatter_data.empty else "FCCD Scatter: No data"),
-                            html.P(f"Layer: {selected_layer}, Site: {selected_cd_site}"),
-                        ], style={'width': '17%', 'display': 'inline-block', 'textAlign': 'center', 'marginLeft': '2%', 'backgroundColor': '#f0f8ff', 'padding': '5px', 'borderRadius': '3px'}),
-                        
-                        html.Div([
-                            html.P(f"DCCD Scatter: {len(dccd_scatter_data)} points" if not dccd_scatter_data.empty else "DCCD Scatter: No data"),
-                            html.P(f"Layer: {selected_layer}, Site: {selected_cd_site}"),
-                        ], style={'width': '17%', 'display': 'inline-block', 'textAlign': 'center', 'marginLeft': '2%', 'backgroundColor': '#f0f8ff', 'padding': '5px', 'borderRadius': '3px'})
-                    ])
-                ], style={'marginTop': 10, 'marginBottom': 20, 'padding': 10, 'backgroundColor': '#f8f9fa', 'borderRadius': 5})
+            # Create wafer header
+            wafer_header = html.Div([
+                html.H3(f"Wafer: {wafer_id}{condition_text}", 
+                       style={'textAlign': 'center', 'margin': '10px 0', 'color': '#333',
+                              'backgroundColor': '#e3f2fd', 'padding': '8px', 'borderRadius': '3px'})
+            ])
             
-            # Combine wafer plots and summary
+            wafer_plots = html.Div(plot_divs, style={'marginBottom': '10px'})
+            
+            # Combine wafer header and plots
             wafer_content = html.Div([
-                wafer_plots,
-                summary_section
+                wafer_header,
+                wafer_plots
             ], style={'marginBottom': '30px', 'border': '1px solid #dee2e6', 'borderRadius': '5px', 'padding': '15px'})
             
             plots.append(wafer_content)
@@ -671,6 +903,53 @@ def generate_plots(filter_option, show_summary, selected_layer=None, selected_cd
 
 # Initialize the Dash app
 app = dash.Dash(__name__)
+
+# Add callback for Excel export
+@app.callback(
+    Output("download-excel", "data"),
+    [Input("export-excel-btn", "n_clicks")],
+    prevent_initial_call=True
+)
+def export_to_excel(n_clicks):
+    if n_clicks:
+        # Generate complete summary statistics
+        summary_df = generate_complete_summary_stats()
+        
+        # Create timestamp for filename
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"MD_etest_Rs_CD_Summary_{timestamp}.xlsx"
+        
+        # Create Excel file in memory
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            # Write main summary data
+            summary_df.to_excel(writer, sheet_name='Summary_Statistics', index=False)
+            
+            # Create a separate sheet with group ranges if needed
+            group_ranges = calculate_group_ranges(wafer_groups, df_fccd_common, df_dccd_common, df_rs_common)
+            if group_ranges:
+                ranges_data = []
+                for (product, lot, layer), ranges in group_ranges.items():
+                    ranges_data.append({
+                        'Product': product,
+                        'Lot': lot,
+                        'Layer': layer,
+                        'RBS_Column': ranges.get('rbs_column'),
+                        'RBS_Min': ranges.get('rbs_min'),
+                        'RBS_Max': ranges.get('rbs_max'),
+                        'FCCD_Min': ranges.get('fccd_min'),
+                        'FCCD_Max': ranges.get('fccd_max'),
+                        'DCCD_Min': ranges.get('dccd_min'),
+                        'DCCD_Max': ranges.get('dccd_max')
+                    })
+                ranges_df = pd.DataFrame(ranges_data)
+                ranges_df.to_excel(writer, sheet_name='Group_Ranges', index=False)
+        
+        output.seek(0)
+        
+        return dcc.send_bytes(output.read(), filename)
+    
+    return dash.no_update
 
 # Add callback to update CD_SITE dropdown based on LAYER selection
 @app.callback(
@@ -692,12 +971,12 @@ def update_cd_site_options(selected_layer):
 @app.callback(
     Output('plots-container', 'children'),
     [Input('filter-radio', 'value'),
-     Input('summary-radio', 'value'),
      Input('layer-dropdown', 'value'),
-     Input('cd-site-dropdown', 'value')]
+     Input('cd-site-dropdown', 'value'),
+     Input('scale-radio', 'value')]
 )
-def update_plots(filter_option, show_summary, selected_layer, selected_cd_site):
-    plots, plot_count = generate_plots(filter_option, show_summary, selected_layer, selected_cd_site)
+def update_plots(filter_option, selected_layer, selected_cd_site, scale_option):
+    plots, plot_count = generate_plots(filter_option, selected_layer, selected_cd_site, scale_option)
     
     if not plots:
         return html.Div([
@@ -797,6 +1076,8 @@ app.layout = html.Div([
                    style={'color': 'blue', 'fontWeight': 'bold', 'margin': '5px 0'}),
             html.P("Correlated areas should show similar colors. MDT layers use RBS_MFW2, MET layers use RBS_MF2W2. Shows RBS, FCCD, and DCCD when available.", 
                    style={'fontStyle': 'italic', 'fontSize': 14, 'margin': '5px 0'}),
+            html.P("Scaling: Auto-scale uses individual wafer ranges for optimal contrast. Normalized scale uses Product/Lot/Layer group min/max for direct comparison between wafers.", 
+                   style={'fontStyle': 'italic', 'fontSize': 12, 'margin': '5px 0', 'color': '#0066cc'}),
             html.P("All plots and tables are filtered by the selected Layer and CD Site. Only Product/Lot/Layer groups matching the dropdown selections are shown.", 
                    style={'fontStyle': 'italic', 'fontSize': 12, 'margin': '5px 0', 'color': '#666'})
         ], style={'backgroundColor': '#f0f0f0', 'padding': '10px', 'borderRadius': '5px', 'marginTop': '10px'})
@@ -815,20 +1096,39 @@ app.layout = html.Div([
                 value='filtered',
                 style={'marginBottom': '15px'}
             )
-        ], style={'width': '23%', 'display': 'inline-block', 'verticalAlign': 'top'}),
+        ], style={'width': '18%', 'display': 'inline-block', 'verticalAlign': 'top'}),
         
         html.Div([
-            html.Label("Display Options:", style={'fontWeight': 'bold', 'marginBottom': '10px', 'display': 'block'}),
+            html.Label("Scale Options:", style={'fontWeight': 'bold', 'marginBottom': '10px', 'display': 'block'}),
             dcc.RadioItems(
-                id='summary-radio',
+                id='scale-radio',
                 options=[
-                    {'label': 'Show data summaries', 'value': 'show'},
-                    {'label': 'Hide data summaries', 'value': 'hide'}
+                    {'label': 'Auto-scale per wafer', 'value': 'auto'},
+                    {'label': 'Normalized scale per group', 'value': 'normalized'}
                 ],
-                value='hide',
+                value='auto',
                 style={'marginBottom': '15px'}
             )
-        ], style={'width': '23%', 'display': 'inline-block', 'verticalAlign': 'top', 'marginLeft': '2%'}),
+        ], style={'width': '18%', 'display': 'inline-block', 'verticalAlign': 'top', 'marginLeft': '2%'}),
+        
+        html.Div([
+            html.Label("Export Options:", style={'fontWeight': 'bold', 'marginBottom': '10px', 'display': 'block'}),
+            html.Button(
+                "Export Summary to Excel",
+                id="export-excel-btn",
+                style={
+                    'backgroundColor': '#28a745',
+                    'color': 'white',
+                    'border': 'none',
+                    'padding': '8px 16px',
+                    'borderRadius': '4px',
+                    'cursor': 'pointer',
+                    'fontSize': '12px',
+                    'fontWeight': 'bold'
+                }
+            ),
+            dcc.Download(id="download-excel")
+        ], style={'width': '18%', 'display': 'inline-block', 'verticalAlign': 'top', 'marginLeft': '2%'}),
         
         html.Div([
             html.Label("Scatter Plot Layer:", style={'fontWeight': 'bold', 'marginBottom': '10px', 'display': 'block'}),
@@ -838,7 +1138,7 @@ app.layout = html.Div([
                 value=unique_layers[0] if unique_layers else None,
                 style={'marginBottom': '15px'}
             )
-        ], style={'width': '23%', 'display': 'inline-block', 'verticalAlign': 'top', 'marginLeft': '2%'}),
+        ], style={'width': '18%', 'display': 'inline-block', 'verticalAlign': 'top', 'marginLeft': '2%'}),
         
         html.Div([
             html.Label("Scatter Plot CD Site:", style={'fontWeight': 'bold', 'marginBottom': '10px', 'display': 'block'}),
@@ -848,7 +1148,7 @@ app.layout = html.Div([
                 value=None,
                 style={'marginBottom': '15px'}
             )
-        ], style={'width': '23%', 'display': 'inline-block', 'verticalAlign': 'top', 'marginLeft': '2%'})
+        ], style={'width': '18%', 'display': 'inline-block', 'verticalAlign': 'top', 'marginLeft': '2%'})
     ], style={'textAlign': 'left', 'marginBottom': 20, 'padding': '15px', 'backgroundColor': '#f8f9fa', 'borderRadius': '5px'}),
     
     # Display plots based on selections
